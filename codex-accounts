@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import json
+import uuid
+import os
+from pathlib import Path
+import plistlib
+import re
+import subprocess
+import sys
+import tempfile
+import sqlite3
+
+BUNDLE_IDS = ('com.openai.codex',)
+ROOT = Path.home() / 'Library/Application Support/Codex Accounts'
+CONFIG = 'cli_auth_credentials_store = "keyring"\n'
+DESKTOP_CHECK = '''
+ObjC.import('AppKit')
+$.NSRunningApplication.runningApplicationsWithBundleIdentifier('com.openai.codex').count
+'''
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if path.is_symlink() or not path.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError(f'目录必须由当前用户独占（权限 700）且不能是符号链接：{path}')
+    return path
+
+
+def profile_name(value):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,39}', value):
+        raise argparse.ArgumentTypeError('名称须由 1–40 个小写字母、数字、下划线或连字符组成，并以字母或数字开头')
+    return value
+
+
+def check_app(app):
+    with (app / 'Contents/Info.plist').open('rb') as manifest:
+        if plistlib.load(manifest).get('CFBundleIdentifier') not in BUNDLE_IDS:
+            raise ValueError('请选择原版 Codex 或新版 ChatGPT 桌面 App')
+    archive = app / 'Contents/Resources/app.asar'
+    with archive.open('rb') as data:
+        import mmap
+        with mmap.mmap(data.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+            if any(contents.find(marker) < 0 for marker in (b'CODEX_ELECTRON_USER_DATA_PATH', b'CODEX_HOME')):
+                raise ValueError('当前 App 未检测到所需的隔离启动支持')
+
+
+def desktop_running():
+    result = subprocess.check_output(
+        ['/usr/bin/osascript', '-l', 'JavaScript', '-e', DESKTOP_CHECK],
+        text=True, timeout=10,
+    )
+    return int(result.strip()) > 0
+
+
+def prepare(root, name):
+    profile = private_dir(root / name)
+    home = private_dir(profile / 'codex')
+    desktop = private_dir(profile / 'desktop')
+    config = home / 'config.toml'
+    if config.is_symlink():
+        raise ValueError(f'配置文件不能是符号链接：{config}')
+    try:
+        with config.open('x', encoding='utf-8') as stream:
+            stream.write(CONFIG)
+    except FileExistsError:
+        pass
+    return home, desktop
+
+
+def include_local_projects(source, target):
+    if not source.is_file():
+        return
+    original = json.loads(source.read_text(encoding='utf-8'))
+    state = json.loads(target.read_text(encoding='utf-8')) if target.exists() else {}
+    projects = state.setdefault('local-projects', {})
+    known_roots = {root for project in projects.values() for root in project.get('rootPaths', [])}
+    added = []
+    source_projects = original.get('local-projects', {})
+    order = dict.fromkeys([*original.get('project-order', []), *source_projects])
+    for key in order:
+        project = source_projects.get(key)
+        if not project or key in projects:
+            continue
+        roots = [root for root in project.get('rootPaths', [])
+                 if Path(root).is_absolute() and Path(root).is_dir() and root not in known_roots]
+        if not roots:
+            continue
+        entry = {field: project[field] for field in ('id', 'name', 'createdAt', 'updatedAt') if field in project}
+        projects[key] = dict(entry, rootPaths=roots)
+        known_roots.update(roots)
+        added.append(key)
+    if added:
+        state.setdefault('project-order', []).extend(added)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=target.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            try:
+                json.dump(state, stream, ensure_ascii=False)
+                stream.flush()
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+
+def sync_local_history(root):
+    """Merge local task records while the desktop application is stopped."""
+    homes = [Path.home() / '.codex']
+    homes.extend(p / 'codex' for p in root.iterdir()
+                 if p.is_dir() and not p.is_symlink() and (p / 'codex').is_dir())
+    existing = [p for p in homes if (p / 'state_5.sqlite').is_file()]
+    if not existing:
+        return
+    backup = private_dir(root / ('history-backup-' + uuid.uuid4().hex))
+    snapshots = []
+    for index, home in enumerate(existing):
+        pair = []
+        for filename in ('state_5.sqlite', 'thread_history_1.sqlite'):
+            source = home / filename
+            if not source.exists():
+                pair.append(None)
+                continue
+            snapshot = backup / f'{index}-{filename}'
+            with sqlite3.connect(source) as source_db, sqlite3.connect(snapshot) as backup_db:
+                source_db.backup(backup_db)
+            pair.append(snapshot)
+        snapshots.append(pair)
+
+    for home in homes:
+        for filename, snapshot in zip(('state_5.sqlite', 'thread_history_1.sqlite'), snapshots[0]):
+            if snapshot is not None and not (home / filename).exists():
+                with sqlite3.connect(snapshot) as source, sqlite3.connect(home / filename) as target:
+                    source.backup(target)
+
+    for home in homes:
+        with sqlite3.connect(home / 'state_5.sqlite') as target:
+            target.execute('PRAGMA foreign_keys=OFF')
+            for state, _ in snapshots:
+                with sqlite3.connect(state) as source:
+                    for table in ('projects', 'project_roots', 'threads', 'thread_attachments',
+                                  'thread_dynamic_tools', 'thread_spawn_edges', 'session_model_ids'):
+                        source_columns = [row[1] for row in source.execute(f'PRAGMA table_info({table})')]
+                        target_columns = {row[1] for row in target.execute(f'PRAGMA table_info({table})')}
+                        columns = [column for column in source_columns if column in target_columns]
+                        if not columns:
+                            continue
+                        names = ','.join('"' + column + '"' for column in columns)
+                        placeholders = ','.join('?' for _ in columns)
+                        for row in source.execute(f'SELECT {names} FROM {table}'):
+                            target.execute(f'INSERT OR IGNORE INTO {table} ({names}) VALUES ({placeholders})', row)
+                            if table == 'threads' and 'updated_at_ms' in columns:
+                                data = dict(zip(columns, row))
+                                current = target.execute('SELECT updated_at_ms FROM threads WHERE id=?', (data['id'],)).fetchone()
+                                if current and (data['updated_at_ms'] or 0) > (current[0] or 0):
+                                    updates = [column for column in columns if column != 'id']
+                                    target.execute('UPDATE threads SET ' + ','.join('"' + column + '"=?' for column in updates) + ' WHERE id=?', [data[column] for column in updates] + [data['id']])
+        history = home / 'thread_history_1.sqlite'
+        if history.exists():
+            with sqlite3.connect(history) as target:
+                for _, snapshot in snapshots:
+                    if snapshot is None:
+                        continue
+                    with sqlite3.connect(snapshot) as source:
+                        for table in ('thread_turns', 'thread_items', 'thread_history_projection_state', 'thread_realtime_items'):
+                            source_columns = [row[1] for row in source.execute(f'PRAGMA table_info({table})')]
+                            target_columns = {row[1] for row in target.execute(f'PRAGMA table_info({table})')}
+                            columns = [column for column in source_columns if column in target_columns]
+                            if not columns:
+                                continue
+                            names = ','.join('"' + column + '"' for column in columns)
+                            placeholders = ','.join('?' for _ in columns)
+                            for row in source.execute(f'SELECT {names} FROM {table}'):
+                                target.execute(f'INSERT OR IGNORE INTO {table} ({names}) VALUES ({placeholders})', row)
+    for source in homes:
+        for target in homes:
+            if source != target:
+                include_local_projects(source / '.codex-global-state.json', target / '.codex-global-state.json')
+
+
+def open_profile(app, root, name):
+    check_app(app)
+    if desktop_running():
+        raise ValueError('请先在 Codex 或 ChatGPT Desktop 中按 ⌘Q 完全退出，再运行本命令')
+    home, desktop = prepare(root, name)
+    sync_local_history(root)
+    state_file = '.codex-global-state.json'
+    include_local_projects(Path.home() / '.codex' / state_file, home / state_file)
+    subprocess.run([
+        '/usr/bin/open', '-n',
+        '--env', f'CODEX_HOME={home}',
+        '--env', f'CODEX_ELECTRON_USER_DATA_PATH={desktop}',
+        str(app), '--args', f'--user-data-dir={desktop}',
+    ], check=True, timeout=30)
+    print(f'已请求打开配置 {name}。首次使用或会话失效时，请在 App 中使用浏览器登录。')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='启动拥有独立认证与数据目录的 Codex Desktop')
+    parser.add_argument('--app', type=Path, default=Path('/Applications/ChatGPT.app'))
+    commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('list', help='列出本机配置名称').add_argument('--json', action='store_true')
+    commands.add_parser('add', help='创建具名账号配置').add_argument('label')
+    commands.add_parser('open', help='打开配置，首次使用时创建').add_argument('name', type=profile_name)
+    commands.add_parser('delete', help='删除已保存的账号').add_argument('name', type=profile_name)
+    args = parser.parse_args()
+    os.umask(0o077)
+    try:
+        root = private_dir(ROOT)
+        if args.command == 'list':
+            profiles = []
+            for entry in sorted(root.iterdir()):
+                if entry.is_dir() and not entry.is_symlink() and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,39}', entry.name):
+                    label_path = entry / 'label'
+                    label = entry.name
+                    if re.fullmatch(r'account-[1-3]', label):
+                        label = f'账号 {label[-1]}'
+                    if label_path.is_file() and not label_path.is_symlink():
+                        label = label_path.read_text(encoding='utf-8').strip() or label
+                    profiles.append({'id': entry.name, 'label': label})
+            if args.json:
+                print(json.dumps(profiles, ensure_ascii=False))
+            else:
+                for profile in profiles:
+                    print(profile['id'])
+        elif args.command == 'add':
+            label = args.label.strip()
+            if not 1 <= len(label) <= 80 or not label.isprintable():
+                raise ValueError('请输入 1–80 个字符的名称')
+            name = uuid.uuid4().hex
+            prepare(root, name)
+            (root / name / 'label').write_text(label, encoding='utf-8')
+            print(name)
+        elif args.command == 'delete':
+            if desktop_running():
+                raise ValueError('请先退出 Codex，再删除账号。')
+            profile = root / args.name
+            if profile.is_symlink() or not profile.is_dir():
+                raise ValueError('账号不存在。')
+            backups = private_dir(root / 'deleted-account-backups')
+            destination = backups / (args.name + '-' + uuid.uuid4().hex)
+            os.rename(profile, destination)
+            print('已删除账号，本地数据已保留在备份中。')
+        else:
+            fd = os.open(root / '.launch.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'r+') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                open_profile(args.app.expanduser().resolve(), root, args.name)
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        parser.exit(1, f'{error}\n')
+
+
+if __name__ == '__main__':
+    main()
